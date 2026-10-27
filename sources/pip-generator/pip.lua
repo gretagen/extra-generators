@@ -15,46 +15,48 @@ gen.name = "pip"
 -- not accepted: a declaration should mean one concrete thing a sync can
 -- verify without re-implementing PEP 440 comparison rules.
 --
--- Backed by pip inside a dedicated SHARED venv (/usr/var/pip/declared)
--- instead of the system site-packages that zeta's own python-* packages own
--- — mixing declarative pip entries into /usr/lib/python3.14/site-packages
--- would blur who owns which file, and a removal could never be safely
--- attributed. The venv is created on the first sync that needs it (plan
--- never mutates; the add's apply runs `python3 -m venv`). /etc/profile.d/
--- pip-haliade.sh (shipped by this package) puts the venv's bin directory on
--- every login shell, so root's sync makes the tools visible to all users.
--- This is the generator shipped by the pip-generator construct; it only
--- runs when "pip" is enabled in /etc/nacelle/enabled_modules.lua (see
--- `pip-generator --help`). The ["pip"] section's default + schema come from
--- the package's plugin config at /etc/nacelle/plugin-configs/pip.lua,
+-- Backed by pip against the SYSTEM environment (/usr/lib/python3.14/
+-- site-packages): what root's sync installs is importable by every
+-- `python3` immediately — scripts, tools and shebang lines need no
+-- PATH or PYTHONPATH gymnastics. The interpreter carries an
+-- EXTERNALLY-MANAGED marker (PEP 668), so installs pass
+-- --break-system-packages explicitly; that is a deliberate system
+-- decision, not an accident. Safety comes from pip itself: pip only ever
+-- uninstalls distributions it holds a RECORD for, so files owned by zeta's
+-- python-* packages are untouchable — and conversely, do not declare a
+-- package zeta already ships (pip would lay its own copy over zeta's
+-- files). This is the generator shipped by the pip-generator construct; it
+-- only runs when "pip" is enabled in /etc/nacelle/enabled_modules.lua (see
+-- `pip-generator --help`). The ["pip"] section's default + schema come
+-- from the package's plugin config at /etc/nacelle/plugin-configs/pip.lua,
 -- auto-loaded by config.lua.
 --
--- Additions diff against `pip list --format=json` inside the venv, whose
--- rows are {"name": ..., "version": ...} objects. Names are compared
--- PEP 503 style (lowercased, runs of "."/"_" folded to "-"), so a declared
--- "pillow" is satisfied by an installed "Pillow". A declared spec counts as
--- installed when the name is present and, with an "==" pin, when the
--- version string is equal — a drifted pin is re-applied: `pip install
--- name==version` swaps the installed version in place.
+-- Additions diff against `pip list --format=json`, whose rows are
+-- {"name": ..., "version": ...} objects. Names are compared PEP 503 style
+-- (lowercased, runs of "."/"_" folded to "-"), so a declared "pillow" is
+-- satisfied by an installed "Pillow". A declared spec counts as installed
+-- when the name is present and, with an "==" pin, when the version string
+-- is equal — a drifted pin is re-applied: `pip install name==version`
+-- swaps the installed version in place.
 --
 -- Removals only ever touch specs THIS generator previously declared,
 -- recorded in /var/db/declared-pip at apply time (mirroring guix) — a
--- package someone installed by hand into the venv is never yanked from
+-- package someone installed by hand with `pip install` is never yanked from
 -- their declaration, and the record is only written when the install
 -- actually ran, so a failed install is retried next sync. The removal
 -- target is the bare name (pip uninstalls by name, not by requirement), and
 -- the uninstall is skipped entirely when the package is already gone from
--- the venv — dropped from the record, not re-removed — as well as when a
--- desired spec still names it (an "==" upgrade is an in-place install, and
--- uninstalling there would rip out the version the add just pinned).
+-- the environment — dropped from the record, not re-removed — as well as
+-- when a desired spec still names it (an "==" upgrade is an in-place
+-- install, and uninstalling there would rip out the version the add just
+-- pinned).
 
 local DECLARED = "/var/db/declared-pip"
 
--- The shared venv declared packages install into. Root's system
--- site-packages belongs to zeta; THIS venv is exposed by
--- /etc/profile.d/pip-haliade.sh (this package).
-local VENV = "/usr/var/pip/declared"
-local PIP = VENV .. "/bin/pip"
+-- pip against the system environment; the marker below is what forces the
+-- explicit --break-system-packages on install/uninstall (PEP 668).
+local PIP = "pip"
+local BREAK = "--break-system-packages"
 
 -- Parse a package requirement, the grammar this generator accepts:
 -- name or name==version. Refs are interpolated into shell commands, so only
@@ -126,8 +128,8 @@ function gen.plan(cfg, sync)
 
   -- Validate and de-duplicate the desired specs, keeping declaration order.
   -- Two specs for the SAME package with different version pins would fight
-  -- over one venv entry every sync, so the first wins and the rest are
-  -- reported; a bare name alongside a pin is the same conflict in slow
+  -- over one site-packages entry every sync, so the first wins and the rest
+  -- are reported; a bare name alongside a pin is the same conflict in slow
   -- motion and is left to the same first-wins rule.
   local desired, desired_set, seen = {}, {}, {}
   local desired_names = {}
@@ -155,23 +157,19 @@ function gen.plan(cfg, sync)
     return {}
   end
 
-  -- Installed distributions of the declared venv, from the one listing call
+  -- Installed distributions, from the one listing call
   -- (`pip list --format=json` prints [{"name": ..., "version": ...}, ...]).
-  -- The venv may not exist yet — plan stays read-only, so a missing venv
-  -- simply lists as empty and every desired spec plans as an addition.
   local installed = {}
-  if sync.shell_output("test -x " .. PIP .. " && echo up") ~= "" then
-    local listing = sync.shell_output(PIP .. " list --format=json") or ""
-    for obj in listing:gmatch("{[^}]*}") do
-      local n = obj:match('"name":%s*"([^"]*)"')
-      local v = obj:match('"version":%s*"([^"]*)"')
-      if n then installed[norm(n)] = v end
-    end
+  local listing = sync.shell_output(PIP .. " list --format=json") or ""
+  for obj in listing:gmatch("{[^}]*}") do
+    local n = obj:match('"name":%s*"([^"]*)"')
+    local v = obj:match('"version":%s*"([^"]*)"')
+    if n then installed[norm(n)] = v end
   end
 
-  -- Does the venv hold this spec? With check_version, "==" must match too
-  -- (additions); without it, any version counts (removals — the record
-  -- still matters after a plain install/upgrade bumped the version).
+  -- Does the environment hold this spec? With check_version, "==" must
+  -- match too (additions); without it, any version counts (removals — the
+  -- record still matters after a plain install/upgrade bumped the version).
   local function matches(spec, check_version)
     local name, version = parse_spec(spec)
     local have = installed[norm(name)]
@@ -180,18 +178,12 @@ function gen.plan(cfg, sync)
     return version == nil or have == version
   end
 
-  -- Install what is declared but not present. The venv itself is created
-  -- here too — planning never mutates the system.
+  -- Install what is declared but not present.
   for _, spec in ipairs(desired) do
     if not matches(spec, true) then
       table.insert(changes, sync.change("+", "pip", spec, nil,
         function(_, s)
-          if not s.shell("test -x " .. PIP .. " || python3 -m venv " .. VENV) then
-            io.stderr:write("[warn] pip: could not create the declared venv at "
-              .. VENV .. "\n")
-            return false
-          end
-          local ok = s.shell(PIP .. " install " .. spec)
+          local ok = s.shell(PIP .. " install " .. BREAK .. " " .. spec)
           if not ok then
             io.stderr:write("[warn] '" .. spec .. "' pip install failed "
               .. "(unknown package, bad version pin, or network error)\n")
@@ -205,9 +197,9 @@ function gen.plan(cfg, sync)
   -- Remove what we previously declared and is no longer desired (never touch
   -- entries this generator does not own). The target is the bare name — pip
   -- uninstalls by name — and the uninstall is skipped when the package is
-  -- already gone from the venv (un-recorded, not re-removed) or when a
-  -- desired spec still names it (a pin change is an in-place upgrade, so
-  -- uninstalling would rip out the version the addition just pinned).
+  -- already gone (un-recorded, not re-removed) or when a desired spec still
+  -- names it (a pin change is an in-place upgrade, so uninstalling would
+  -- rip out the version the addition just pinned).
   local undeclared = {}
   for spec in pairs(read_declared(sync)) do
     if not desired_set[spec] then undeclared[#undeclared + 1] = spec end
@@ -222,7 +214,7 @@ function gen.plan(cfg, sync)
     table.insert(changes, sync.change("-", "pip", spec, nil,
       function(_, s)
         if present and not superseded then
-          local ok = s.shell(PIP .. " uninstall -y " .. name)
+          local ok = s.shell(PIP .. " uninstall -y " .. BREAK .. " " .. name)
           if not ok then
             io.stderr:write("[warn] '" .. spec .. "' — pip uninstall failed\n")
             return false
